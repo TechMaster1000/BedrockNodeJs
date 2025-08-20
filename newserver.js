@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
+import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
 
 dotenv.config();
 
@@ -70,6 +71,75 @@ class BedrockService {
     this.region = process.env.AWS_REGION || 'us-east-1';
     this.maxTokens = parseInt(process.env.MAX_TOKENS) || 4000;
     this.temperature = parseFloat(process.env.TEMPERATURE) || 0.7;
+    this.assumedRoleCredentials = null;
+    this.credentialsExpiry = null;
+  }
+
+  async assumeRole() {
+    try {
+      const roleArn = process.env.CROSS_ACCOUNT_ROLE;
+      if (!roleArn) {
+        console.log('No CROSS_ACCOUNT_ROLE specified, using default credentials');
+        return null;
+      }
+
+      // Check if credentials are still valid
+      if (this.assumedRoleCredentials && this.credentialsExpiry && new Date() < this.credentialsExpiry) {
+        return this.assumedRoleCredentials;
+      }
+
+      console.log('Assuming role:', roleArn);
+
+      const stsClient = new STSClient({
+        region: this.region,
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        }
+      });
+
+      const assumeRoleCommand = new AssumeRoleCommand({
+        RoleArn: roleArn,
+        RoleSessionName: 'InvokeAgentSession',
+      });
+
+      const assumedRole = await stsClient.send(assumeRoleCommand);
+      const credentials = assumedRole.Credentials;
+
+      this.assumedRoleCredentials = {
+        accessKeyId: credentials.AccessKeyId,
+        secretAccessKey: credentials.SecretAccessKey,
+        sessionToken: credentials.SessionToken,
+      };
+
+      this.credentialsExpiry = credentials.Expiration;
+      
+      console.log('Successfully assumed role, credentials expire at:', this.credentialsExpiry);
+      return this.assumedRoleCredentials;
+
+    } catch (error) {
+      console.error('Error assuming role:', error);
+      throw error;
+    }
+  }
+
+  async getBedrockClient() {
+    const assumedCredentials = await this.assumeRole();
+    
+    const clientConfig = {
+      region: this.region
+    };
+
+    if (assumedCredentials) {
+      clientConfig.credentials = assumedCredentials;
+    } else if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+      clientConfig.credentials = {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      };
+    }
+
+    return new BedrockRuntimeClient(clientConfig);
   }
 
   validateMessages(messages) {
@@ -141,6 +211,9 @@ class BedrockService {
       }
 
       console.log(`Sending request to Bedrock model: ${this.modelId}`);
+
+      // Get Bedrock client with assume role credentials if configured
+      const bedrockClient = await this.getBedrockClient();
 
       const command = new InvokeModelWithResponseStreamCommand({
         modelId: this.modelId,
