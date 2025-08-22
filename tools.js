@@ -27,13 +27,70 @@ class BedrockService:
 
 When users ask questions that might benefit from specific information, documentation, or policies, use the search_passages tool to retrieve relevant information before answering.
 
-Guidelines:
+CRITICAL FORMATTING RULES:
+You MUST format your responses using proper HTML tags for a professional appearance:
+
+1. **Structure and Spacing**:
+   - Use <p> tags for paragraphs with proper spacing
+   - Use <br> for line breaks where needed
+   - Use <hr> for section dividers when appropriate
+
+2. **Text Emphasis**:
+   - Use <strong> or <b> for important terms, headings, and key points
+   - Use <em> or <i> for emphasis on specific words
+   - Use <u> for underlined text when highlighting critical information
+
+3. **Lists and Organization**:
+   - Use <ul> and <li> for unordered lists
+   - Use <ol> and <li> for numbered/ordered lists
+   - Use <dl>, <dt>, and <dd> for definition lists when explaining terms
+
+4. **Headings and Sections**:
+   - Use <h3> for main section headings
+   - Use <h4> for subsection headings
+   - Use <h5> for minor headings
+
+5. **Special Formatting**:
+   - Use <code> for inline code, commands, or technical terms
+   - Use <pre> for code blocks or formatted text that needs spacing preserved
+   - Use <blockquote> for quoted text or important callouts
+   - Use <mark> to highlight very important information
+
+6. **Professional Elements**:
+   - Use <div class="alert"> or <div class="note"> style blocks for warnings/notes
+   - Use <span> with inline styles for colored text when emphasizing status (e.g., <span style="color: green;">✓ Success</span>)
+   - Use <table>, <tr>, <td> for tabular data when comparing information
+
+EXAMPLE FORMAT:
+<h3>Main Topic</h3>
+<p>This is an introductory paragraph with <strong>important information</strong> highlighted.</p>
+
+<h4>Key Points:</h4>
+<ul>
+  <li><strong>First Point:</strong> Detailed explanation here</li>
+  <li><strong>Second Point:</strong> Another explanation</li>
+</ul>
+
+<blockquote>
+  <p><strong>Note:</strong> Important information to remember</p>
+</blockquote>
+
+TOOL USAGE GUIDELINES:
 1. Use the search tool when users ask about specific procedures, policies, documentation, or factual information
 2. Choose the appropriate context (Crew, Developer, or PolicyExpert) based on the nature of the query
-3. After retrieving passages, synthesize the information clearly and cite sources when appropriate
-4. If no relevant information is found, acknowledge this and provide the best answer you can based on general knowledge
+3. After retrieving passages, synthesize the information clearly and cite sources appropriately
+4. If no relevant information is found, acknowledge this and provide the best answer based on general knowledge
 
-Be professional, clear, and helpful in all responses."""
+RESPONSE GUIDELINES:
+- Always start with a clear, well-formatted response
+- Use proper HTML structure throughout
+- Make responses scannable with good visual hierarchy
+- Bold key terms and important information
+- Use appropriate spacing between sections
+- Include relevant links when referencing sources
+- Be professional, clear, and helpful in all responses
+
+Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Your responses will be rendered as HTML."""
             }
         ]
     
@@ -137,38 +194,46 @@ Be professional, clear, and helpful in all responses."""
                     if response.status == 200:
                         data = await response.json()
                         
-                        # Format the passages for the model
+                        # Format the passages for the model with HTML formatting
                         if "items" in data and data["items"]:
-                            passages_text = f"Based on the {context} knowledge base, here are the relevant passages for '{query}':\n\n"
+                            passages_text = f"<h4>Search Results from {context} Knowledge Base</h4>\n"
+                            passages_text += f"<p><em>Query: \"{query}\"</em></p>\n<hr>\n\n"
                             
                             for i, item in enumerate(data["items"], 1):
-                                passages_text += f"**Passage {i}**\n"
-                                passages_text += f"Text: {item.get('text', 'N/A')}\n"
+                                passages_text += f"<div class='passage'>\n"
+                                passages_text += f"<h5>Passage {i}</h5>\n"
+                                passages_text += f"<blockquote>{item.get('text', 'N/A')}</blockquote>\n"
                                 
                                 if "document" in item:
                                     doc = item["document"]
+                                    passages_text += "<p class='source-info'>"
                                     if "title" in doc:
-                                        passages_text += f"Source: {doc['title']}\n"
+                                        passages_text += f"<strong>Source:</strong> {doc['title']}<br>"
                                     if "clickableuri" in doc:
-                                        passages_text += f"Link: {doc['clickableuri']}\n"
+                                        passages_text += f"<strong>Link:</strong> <a href='{doc['clickableuri']}'>{doc['clickableuri']}</a><br>"
+                                    passages_text += "</p>"
                                 
                                 if "relevanceScore" in item:
-                                    passages_text += f"Relevance: {item['relevanceScore']:.2f}\n"
+                                    relevance_pct = item['relevanceScore'] * 100
+                                    color = "green" if relevance_pct > 80 else "orange" if relevance_pct > 60 else "gray"
+                                    passages_text += f"<p><span style='color: {color};'>Relevance: {relevance_pct:.1f}%</span></p>\n"
                                 
-                                passages_text += "\n"
+                                passages_text += "</div>\n"
+                                if i < len(data["items"]):
+                                    passages_text += "<hr style='margin: 20px 0; border: 0; border-top: 1px solid #eee;'>\n"
                             
                             logger.info(f"Found {len(data['items'])} passages for query: {query}")
                             return passages_text
                         else:
-                            return f"No relevant passages found in the {context} knowledge base for '{query}'."
+                            return f"<p><em>No relevant passages found in the {context} knowledge base for '{query}'.</em></p>"
                     else:
                         error_text = await response.text()
                         logger.error(f"Coveo API error: {response.status} - {error_text}")
-                        return f"I encountered an error searching the knowledge base (Status: {response.status})"
+                        return f"<p style='color: red;'>I encountered an error searching the knowledge base (Status: {response.status})</p>"
                         
         except Exception as e:
             logger.error(f"Error calling Coveo Passage Retrieval API: {str(e)}")
-            return f"I encountered an error while searching the knowledge base: {str(e)}"
+            return f"<p style='color: red;'>I encountered an error while searching the knowledge base: {str(e)}</p>"
     
     def build_message_history(self, conversation_history: List[Message], new_message: str) -> List[dict]:
         """Build message history for Bedrock API"""
