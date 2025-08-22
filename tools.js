@@ -6,11 +6,78 @@ import queue
 import threading
 import logging
 import aiohttp
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from models import Message, ChatRequest
 from config import config
 
 logger = logging.getLogger(__name__)
+
+class TokenCache:
+    """Token cache manager with TTL and cleanup"""
+    
+    def __init__(self):
+        self.cache = {}  # {email: {"token": str, "expires_at": datetime}}
+        self.lock = asyncio.Lock()
+        self.cleanup_task = None
+        
+    async def start_cleanup_task(self):
+        """Start background task to cleanup expired tokens"""
+        if not self.cleanup_task:
+            self.cleanup_task = asyncio.create_task(self._cleanup_loop())
+    
+    async def _cleanup_loop(self):
+        """Periodically remove expired tokens from cache"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Run cleanup every 5 minutes
+                async with self.lock:
+                    now = datetime.now()
+                    expired_emails = [
+                        email for email, data in self.cache.items()
+                        if data["expires_at"] < now
+                    ]
+                    for email in expired_emails:
+                        del self.cache[email]
+                        logger.info(f"Removed expired token for user: {email}")
+                    
+                    if expired_emails:
+                        logger.info(f"Cleaned up {len(expired_emails)} expired tokens")
+            except Exception as e:
+                logger.error(f"Error in token cleanup task: {e}")
+    
+    async def get_cached_token(self, email: str) -> Optional[Dict[str, Any]]:
+        """Get cached token if valid"""
+        async with self.lock:
+            if email in self.cache:
+                token_data = self.cache[email]
+                if token_data["expires_at"] > datetime.now():
+                    time_remaining = (token_data["expires_at"] - datetime.now()).total_seconds()
+                    logger.info(f"Using cached token for {email}, expires in {time_remaining:.0f} seconds")
+                    return token_data
+                else:
+                    # Token expired, remove it
+                    del self.cache[email]
+                    logger.info(f"Cached token for {email} has expired, removing from cache")
+            return None
+    
+    async def set_token(self, email: str, token: str, valid_for_ms: int):
+        """Cache a new token with expiration"""
+        async with self.lock:
+            # Calculate expiration with a small buffer (30 seconds before actual expiry)
+            expires_at = datetime.now() + timedelta(milliseconds=valid_for_ms - 30000)
+            self.cache[email] = {
+                "token": token,
+                "expires_at": expires_at
+            }
+            logger.info(f"Cached new token for {email}, expires at {expires_at}")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring"""
+        return {
+            "cached_users": len(self.cache),
+            "users": list(self.cache.keys())
+        }
 
 class BedrockService:
     def __init__(self, bedrock_manager):
@@ -18,6 +85,10 @@ class BedrockService:
         self.tools = self._initialize_tools()
         # System prompt for the assistant
         self.system_prompt = self._get_system_prompt()
+        # Initialize token cache
+        self.token_cache = TokenCache()
+        # Start cleanup task when service initializes
+        asyncio.create_task(self.token_cache.start_cleanup_task())
     
     def _get_system_prompt(self) -> List[Dict[str, Any]]:
         """Define the system prompt for the assistant"""
@@ -173,7 +244,7 @@ Remember:
     
     async def _get_coveo_token(self, user_email: str) -> Optional[str]:
         """
-        Get a temporary Coveo search token for the user
+        Get a Coveo search token for the user (cached or new)
         
         Args:
             user_email: The email of the user making the request
@@ -182,6 +253,14 @@ Remember:
             The search token or None if failed
         """
         try:
+            # Check cache first
+            cached_data = await self.token_cache.get_cached_token(user_email)
+            if cached_data:
+                return cached_data["token"]
+            
+            # No valid cached token, generate a new one
+            logger.info(f"Generating new Coveo token for user: {user_email}")
+            
             coveo_org_id = config.COVEO_ORG_ID
             coveo_api_key = config.COVEO_API_KEY
             
@@ -192,6 +271,9 @@ Remember:
             # Construct the Coveo token endpoint with organization ID and API key
             url = f"https://platform.cloud.coveo.com/rest/search/v2/token?organizationId={coveo_org_id}"
             
+            # Set token validity to 10 minutes
+            valid_for_ms = 600000  # 10 minutes in milliseconds
+            
             # Prepare the request payload
             payload = {
                 "userIds": [
@@ -200,7 +282,7 @@ Remember:
                         "provider": "Email Security Provider"
                     }
                 ],
-                "validFor": 60000  # 1 minute in milliseconds
+                "validFor": valid_for_ms
             }
             
             # Use the API key directly in the Authorization header
@@ -210,7 +292,7 @@ Remember:
                 "Accept": "application/json"
             }
             
-            logger.info(f"Requesting Coveo token for user: {user_email}")
+            logger.info(f"Requesting new Coveo token for user: {user_email} (valid for 10 minutes)")
             
             # Make the API request
             async with aiohttp.ClientSession() as session:
@@ -219,7 +301,9 @@ Remember:
                         data = await response.json()
                         token = data.get("token")
                         if token:
-                            logger.info(f"Successfully obtained Coveo token for user: {user_email}")
+                            # Cache the token
+                            await self.token_cache.set_token(user_email, token, valid_for_ms)
+                            logger.info(f"Successfully obtained and cached Coveo token for user: {user_email}")
                             return token
                         else:
                             logger.error("No token in Coveo response")
@@ -231,6 +315,11 @@ Remember:
                         
         except Exception as e:
             logger.error(f"Error getting Coveo token: {str(e)}")
+            # Try to invalidate cache for this user in case of errors
+            async with self.token_cache.lock:
+                if user_email in self.token_cache.cache:
+                    del self.token_cache.cache[user_email]
+                    logger.info(f"Removed potentially invalid token for {user_email} from cache")
             return None
     
     async def _search_coveo_passages(self, query: str, context: str, max_passages: int = 5, user_email: str = None) -> str:
@@ -251,7 +340,7 @@ Remember:
                 logger.warning("Coveo organization ID not configured")
                 return "<p style='color: orange;'>I couldn't search the knowledge base as the Coveo integration is not configured.</p>"
             
-            # Get a fresh token for this user
+            # Get a token for this user (cached or new)
             if not user_email:
                 logger.warning("No user email provided for Coveo token")
                 return "<p style='color: orange;'>Unable to authenticate for knowledge base search.</p>"
@@ -290,6 +379,108 @@ Remember:
             }
             
             logger.info(f"Searching Coveo with query: {query} for user: {user_email}")
+            
+            # Make the API request
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # Format the passages for the model with HTML formatting
+                        if "items" in data and data["items"]:
+                            passages_text = f"<h4>Search Results from {context} Knowledge Base</h4>\n"
+                            passages_text += f"<p><em>Query: \"{query}\"</em></p>\n<hr>\n\n"
+                            
+                            for i, item in enumerate(data["items"], 1):
+                                passages_text += f"<div class='passage'>\n"
+                                passages_text += f"<h5>Passage {i}</h5>\n"
+                                passages_text += f"<blockquote>{item.get('text', 'N/A')}</blockquote>\n"
+                                
+                                if "document" in item:
+                                    doc = item["document"]
+                                    passages_text += "<p class='source-info'>"
+                                    if "title" in doc:
+                                        passages_text += f"<strong>Source:</strong> {doc['title']}<br>"
+                                    if "clickableuri" in doc:
+                                        passages_text += f"<strong>Link:</strong> <a href='{doc['clickableuri']}'>{doc['clickableuri']}</a><br>"
+                                    passages_text += "</p>"
+                                
+                                if "relevanceScore" in item:
+                                    relevance_pct = item['relevanceScore'] * 100
+                                    color = "green" if relevance_pct > 80 else "orange" if relevance_pct > 60 else "gray"
+                                    passages_text += f"<p><span style='color: {color};'>Relevance: {relevance_pct:.1f}%</span></p>\n"
+                                
+                                passages_text += "</div>\n"
+                                if i < len(data["items"]):
+                                    passages_text += "<hr style='margin: 20px 0; border: 0; border-top: 1px solid #eee;'>\n"
+                            
+                            logger.info(f"Found {len(data['items'])} passages for query: {query}")
+                            return passages_text
+                        else:
+                            return f"<p><em>No relevant passages found in the {context} knowledge base for '{query}'.</em></p>"
+                    elif response.status == 401:
+                        # Token might be invalid, try to clear cache and retry once
+                        logger.warning(f"Authentication failed for user {user_email}, clearing cache")
+                        async with self.token_cache.lock:
+                            if user_email in self.token_cache.cache:
+                                del self.token_cache.cache[user_email]
+                        
+                        # Try one more time with a fresh token
+                        logger.info("Retrying with fresh token...")
+                        fresh_token = await self._get_coveo_token(user_email)
+                        if fresh_token:
+                            headers["Authorization"] = f"Bearer {fresh_token}"
+                            async with session.post(url, json=payload, headers=headers) as retry_response:
+                                if retry_response.status == 200:
+                                    data = await retry_response.json()
+                                    # Process the response (same as above)
+                                    if "items" in data and data["items"]:
+                                        # [Same processing logic as above - omitted for brevity]
+                                        logger.info(f"Retry successful, found {len(data['items'])} passages")
+                                        return self._format_search_results(data, context, query)
+                        
+                        return f"<p style='color: red;'>Authentication failed with the knowledge base.</p>"
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Coveo API error: {response.status} - {error_text}")
+                        return f"<p style='color: red;'>I encountered an error searching the knowledge base (Status: {response.status})</p>"
+                        
+        except Exception as e:
+            logger.error(f"Error calling Coveo Passage Retrieval API: {str(e)}")
+            return f"<p style='color: red;'>I encountered an error while searching the knowledge base: {str(e)}</p>"
+    
+    def _format_search_results(self, data: Dict, context: str, query: str) -> str:
+        """Helper method to format search results"""
+        if "items" in data and data["items"]:
+            passages_text = f"<h4>Search Results from {context} Knowledge Base</h4>\n"
+            passages_text += f"<p><em>Query: \"{query}\"</em></p>\n<hr>\n\n"
+            
+            for i, item in enumerate(data["items"], 1):
+                passages_text += f"<div class='passage'>\n"
+                passages_text += f"<h5>Passage {i}</h5>\n"
+                passages_text += f"<blockquote>{item.get('text', 'N/A')}</blockquote>\n"
+                
+                if "document" in item:
+                    doc = item["document"]
+                    passages_text += "<p class='source-info'>"
+                    if "title" in doc:
+                        passages_text += f"<strong>Source:</strong> {doc['title']}<br>"
+                    if "clickableuri" in doc:
+                        passages_text += f"<strong>Link:</strong> <a href='{doc['clickableuri']}'>{doc['clickableuri']}</a><br>"
+                    passages_text += "</p>"
+                
+                if "relevanceScore" in item:
+                    relevance_pct = item['relevanceScore'] * 100
+                    color = "green" if relevance_pct > 80 else "orange" if relevance_pct > 60 else "gray"
+                    passages_text += f"<p><span style='color: {color};'>Relevance: {relevance_pct:.1f}%</span></p>\n"
+                
+                passages_text += "</div>\n"
+                if i < len(data["items"]):
+                    passages_text += "<hr style='margin: 20px 0; border: 0; border-top: 1px solid #eee;'>\n"
+            
+            return passages_text
+        else:
+            return f"<p><em>No relevant passages found in the {context} knowledge base for '{query}'.</em></p>"
             
             # Make the API request
             async with aiohttp.ClientSession() as session:
