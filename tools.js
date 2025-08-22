@@ -28,12 +28,13 @@ class BedrockService:
 When users ask questions that might benefit from specific information, documentation, or policies, use the search_passages tool to retrieve relevant information before answering.
 
 CRITICAL FORMATTING RULES:
-You MUST format your responses using proper HTML tags for a professional appearance:
+You MUST format your responses using proper HTML tags for a professional appearance. NEVER use \n or \n\n for line breaks - use HTML tags instead.
 
 1. **Structure and Spacing**:
-   - Use <p> tags for paragraphs with proper spacing
-   - Use <br> for line breaks where needed
+   - Use <p> tags for paragraphs (these automatically create spacing)
+   - Use <br> for single line breaks only when needed within a paragraph
    - Use <hr> for section dividers when appropriate
+   - NEVER use \n or \n\n - let HTML tags handle all spacing
 
 2. **Text Emphasis**:
    - Use <strong> or <b> for important terms, headings, and key points
@@ -61,16 +62,14 @@ You MUST format your responses using proper HTML tags for a professional appeara
    - Use <span> with inline styles for colored text when emphasizing status (e.g., <span style="color: green;">✓ Success</span>)
    - Use <table>, <tr>, <td> for tabular data when comparing information
 
-EXAMPLE FORMAT:
+EXAMPLE FORMAT (no \n characters):
 <h3>Main Topic</h3>
 <p>This is an introductory paragraph with <strong>important information</strong> highlighted.</p>
-
 <h4>Key Points:</h4>
 <ul>
   <li><strong>First Point:</strong> Detailed explanation here</li>
   <li><strong>Second Point:</strong> Another explanation</li>
 </ul>
-
 <blockquote>
   <p><strong>Note:</strong> Important information to remember</p>
 </blockquote>
@@ -86,11 +85,11 @@ RESPONSE GUIDELINES:
 - Use proper HTML structure throughout
 - Make responses scannable with good visual hierarchy
 - Bold key terms and important information
-- Use appropriate spacing between sections
+- Let HTML tags handle spacing - never use \n or \n\n
 - Include relevant links when referencing sources
 - Be professional, clear, and helpful in all responses
 
-Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Your responses will be rendered as HTML."""
+Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Never use \n or \n\n for spacing. Your responses will be rendered as HTML."""
             }
         ]
     
@@ -129,7 +128,7 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
             }
         ]
     
-    async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
+    async def execute_tool(self, tool_name: str, tool_input: Dict[str, Any], user_email: str = None) -> str:
         """Execute the Coveo search tool"""
         logger.info(f"Executing tool: {tool_name} with input: {tool_input}")
         
@@ -137,12 +136,75 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
             return await self._search_coveo_passages(
                 tool_input.get("query", ""),
                 tool_input.get("context", "Crew"),
-                tool_input.get("maxPassages", 5)
+                tool_input.get("maxPassages", 5),
+                user_email
             )
         else:
             return f"Unknown tool: {tool_name}"
     
-    async def _search_coveo_passages(self, query: str, context: str, max_passages: int = 5) -> str:
+    async def _get_coveo_token(self, user_email: str) -> Optional[str]:
+        """
+        Get a temporary Coveo search token for the user
+        
+        Args:
+            user_email: The email of the user making the request
+            
+        Returns:
+            The search token or None if failed
+        """
+        try:
+            coveo_org_id = config.COVEO_ORG_ID
+            coveo_api_key = config.COVEO_API_KEY
+            
+            if not coveo_org_id or not coveo_api_key:
+                logger.warning("Coveo organization ID or API key not configured")
+                return None
+            
+            # Construct the Coveo token endpoint with organization ID and API key
+            url = f"https://platform.cloud.coveo.com/rest/search/v2/token?organizationId={coveo_org_id}"
+            
+            # Prepare the request payload
+            payload = {
+                "userIds": [
+                    {
+                        "name": user_email,
+                        "provider": "Email Security Provider"
+                    }
+                ],
+                "validFor": 60000  # 1 minute in milliseconds
+            }
+            
+            # Use the API key directly in the Authorization header
+            headers = {
+                "Authorization": f"Bearer {coveo_api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            logger.info(f"Requesting Coveo token for user: {user_email}")
+            
+            # Make the API request
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        token = data.get("token")
+                        if token:
+                            logger.info(f"Successfully obtained Coveo token for user: {user_email}")
+                            return token
+                        else:
+                            logger.error("No token in Coveo response")
+                            return None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to get Coveo token. Status: {response.status}, Error: {error_text}")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"Error getting Coveo token: {str(e)}")
+            return None
+    
+    async def _search_coveo_passages(self, query: str, context: str, max_passages: int = 5, user_email: str = None) -> str:
         """
         Search Coveo Passage Retrieval API for relevant passages
         
@@ -154,12 +216,21 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
         try:
             # Get Coveo configuration from environment
             coveo_org_id = config.COVEO_ORG_ID
-            coveo_api_key = config.COVEO_API_KEY
             search_hub = config.COVEO_SEARCH_HUB
             
-            if not coveo_org_id or not coveo_api_key:
-                logger.warning("Coveo credentials not configured")
-                return "I couldn't search the knowledge base as the Coveo integration is not configured."
+            if not coveo_org_id:
+                logger.warning("Coveo organization ID not configured")
+                return "<p style='color: orange;'>I couldn't search the knowledge base as the Coveo integration is not configured.</p>"
+            
+            # Get a fresh token for this user
+            if not user_email:
+                logger.warning("No user email provided for Coveo token")
+                return "<p style='color: orange;'>Unable to authenticate for knowledge base search.</p>"
+            
+            coveo_token = await self._get_coveo_token(user_email)
+            if not coveo_token:
+                logger.error("Failed to obtain Coveo token")
+                return "<p style='color: red;'>Failed to authenticate with the knowledge base.</p>"
             
             # Construct the Coveo Passage Retrieval API endpoint
             url = f"https://{coveo_org_id}.org.coveo.com/rest/search/v3/passages/retrieve"
@@ -182,11 +253,14 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
                 }
             }
             
+            # Use the user-specific token for the search
             headers = {
-                "Authorization": f"Bearer {coveo_api_key}",
+                "Authorization": f"Bearer {coveo_token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json"
             }
+            
+            logger.info(f"Searching Coveo with query: {query} for user: {user_email}")
             
             # Make the API request
             async with aiohttp.ClientSession() as session:
@@ -296,7 +370,8 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
         max_tokens: int,
         temperature: float,
         model_type: str,
-        result_queue: queue.Queue
+        result_queue: queue.Queue,
+        user_email: str = None
     ):
         """Worker thread for streaming responses with tool support"""
         try:
@@ -366,13 +441,13 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
                         tool_input_json = json.loads(tool_input)
                         logger.info(f"Executing {tool_name} with input: {tool_input_json}")
                         
-                        # Execute tool synchronously
+                        # Execute tool synchronously with user email
                         import asyncio
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         try:
                             tool_result = loop.run_until_complete(
-                                self.execute_tool(tool_name, tool_input_json)
+                                self.execute_tool(tool_name, tool_input_json, user_email)
                             )
                         finally:
                             loop.close()
@@ -512,7 +587,7 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
                                   "search", "find", "look up", "retrieve", "information about"])
             )
             
-            logger.info(f"Starting stream. Tools enabled: {should_use_tools}")
+            logger.info(f"Starting stream for user {request.email}. Tools enabled: {should_use_tools}")
             
             # Use appropriate worker based on tool usage
             if should_use_tools:
@@ -523,7 +598,8 @@ Remember: ALWAYS use HTML formatting. Never use markdown (* or ** or # or -). Yo
                         max_tokens,
                         temperature,
                         request.bedrockModelType,
-                        result_queue
+                        result_queue,
+                        request.email  # Pass user email for Coveo token
                     ),
                     daemon=True
                 )
